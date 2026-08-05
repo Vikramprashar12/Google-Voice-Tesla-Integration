@@ -1,154 +1,115 @@
 # Tesla Fleet API CLI
 
-A Python program for authenticating with and sending commands to the Tesla
-Fleet API.
+A tool that lets you check on and control a Tesla car from a computer,
+without opening the Tesla mobile app. It talks directly to Tesla's own
+official API — the same system the Tesla app itself uses — so anything you
+could tap a button for in the app, this can do from a script instead.
 
-## How it's split up
+## What it actually does
 
-- **Reads** (vehicle list, `vehicle_data`, `wake_up`, region lookup) go
-  straight to Tesla's Fleet API.
-- **Commands** (lock, honk, climate, charging, etc.) on 2021+ vehicles must be
-  cryptographically signed end-to-end. Tesla does not support signing from a
-  plain HTTP client, so commands are sent to a locally running
-  **`tesla-http-proxy`** (Tesla's official Go binary), which signs them and
-  forwards them to the car. This program talks to that proxy for anything
-  under `/command/...`.
+At a high level, the project does two things:
 
-```
-tesla_fleet/
-  config.py   # env-driven configuration
-  auth.py     # OAuth2 authorization-code flow + token cache/refresh
-  api.py      # Fleet API client (direct reads + proxy-signed commands)
-  commands.py # catalog of all known vehicle commands
-  cli.py      # argparse CLI
-tesla_cli.py  # entrypoint: python tesla_cli.py <action> ...
-```
+**It checks on your car.** It can ask Tesla's servers whether the car is
+awake, where it stands on battery charge, what the climate settings are,
+whether the doors are locked, and dozens of other details — the same
+information the Tesla app shows on its home screen.
 
-## 1. Install dependencies
+**It controls your car.** Beyond just reading status, it can lock or unlock
+the doors, start or stop climate control, open the charge port, start or
+stop charging, set a charge limit, turn on Sentry Mode, vent the windows or
+sunroof, flash the lights, honk the horn, and more — around 40 different
+actions in total, covering nearly everything the official app can trigger
+remotely.
 
-```bash
-pip install -r requirements.txt
-```
+Because it goes through Tesla's own systems rather than reverse-engineering
+anything, it works the same way an authorized third-party app would: you
+sign in with your real Tesla account, you approve access the same way you'd
+approve any app, and Tesla treats every request the same as it would coming
+from an official partner.
 
-## 2. Configure
+## Why this exists
 
-Copy `.env.example` to `.env` and fill in the values from your existing Tesla
-Developer app (developer.tesla.com):
+The Tesla app is great for a person tapping buttons, but it has no way to
+be automated. There's no way to tell it "lock the car every night at 11pm,"
+or "text me if charging stops early," or "start the climate control
+whenever my calendar says I'm about to leave work." Anyone who wants their
+Tesla to participate in that kind of automation has to talk to Tesla's
+underlying API themselves — and that API is intentionally locked down, both
+for security and because Tesla wants to know which apps are accessing a
+car and why.
 
-```bash
-cp .env.example .env
-```
+This project is that missing piece: the plumbing needed to safely and
+correctly talk to Tesla's official API, already built, so it can be reused
+as a building block for other ideas (automations, dashboards, notifications,
+integrations with other smart-home tools, etc.) instead of everyone having
+to build that plumbing from scratch.
 
-- `TESLA_CLIENT_ID` / `TESLA_CLIENT_SECRET` — from your registered app.
-- `TESLA_REDIRECT_URI` — must exactly match a redirect URI registered on the
-  app. `https://localhost:8585/callback` works well with the built-in login
-  helper below (it spins up a throwaway local HTTPS listener to catch the
-  code).
-- `TESLA_SCOPES` — must be a subset of what your app requested. Needs at
-  least `vehicle_cmds` for control commands, `vehicle_charging_cmds` for
-  charging commands, and `offline_access` so you get a refresh token.
+## How the "talking to Tesla" part works, in plain terms
 
-## 3. Log in (OAuth authorization-code flow)
+Getting a program to control a real car isn't as simple as sending it a
+web request — Tesla has two layers of protection in place, and this project
+respects both of them:
 
-```bash
-python tesla_cli.py login
-```
+1. **Signing in.** The first step is a normal login: you're sent to Tesla's
+   real login page, you sign in with your Tesla account exactly as you
+   would in the app, and you approve the specific permissions being
+   requested (e.g. "see vehicle data" or "send commands"). Tesla then hands
+   back a pair of digital keys that prove who you are for future requests,
+   so you don't have to log in again every time.
 
-This opens the Tesla login/consent page in your browser, catches the
-redirect locally, exchanges the code for tokens, and caches them in
-`.tesla_tokens.json` (git-ignore this file — treat it like a credential).
-Tokens are refreshed automatically on expiry by every other command.
+2. **Proving a command is really from you.** Simply checking on a car (like
+   asking "what's the battery level?") is low-risk, so that part talks to
+   Tesla directly. But *commands* — anything that actually changes something
+   about the car, like unlocking a door — go through an extra layer of
+   protection that Tesla requires for newer vehicles: every command has to
+   be digitally signed with a private key that only you hold, using a small
+   helper program that Tesla itself publishes. That signed command is then
+   what actually reaches the car. This is the same protection Tesla's own
+   app relies on; it exists so that a stolen login alone can never be
+   enough to, say, remotely unlock someone's car.
 
-Then discover which regional Fleet API host your account uses (also useful
-to sanity-check the login worked):
+Once both of those are set up, the everyday experience is simple: run a
+command, get back exactly what the car did.
 
-```bash
-python tesla_cli.py region
-```
+## What makes this different from a typical "Tesla dashboard"
 
-Set the returned URL as `TESLA_FLEET_API_BASE` in `.env` if it differs from
-the default.
+Most hobby projects around Tesla's API are visual dashboards meant to be
+looked at. This one is deliberately the opposite — it has no screen at all.
+It's built to be *used by other programs and scripts*, which makes it a
+building block rather than a destination: something you could wire into a
+home-automation system, a scheduled task, a notification bot, or a future
+dashboard, rather than something you sit and stare at.
 
-## 4. Set up command signing (`tesla-http-proxy`)
+It also doesn't cut corners on the security requirement described above.
+A lot of simpler example projects skip the command-signing step entirely
+and only work on older vehicles as a result; this one implements it
+properly so it keeps working on current Tesla models.
 
-Required once per machine before any *command* (not read) will work on a
-2021+ vehicle:
+## Vehicles supported
 
-1. Generate an EC key pair for command signing:
-   ```bash
-   openssl ecparam -name prime256v1 -genkey -noout -out private-key.pem
-   openssl ec -in private-key.pem -pubout -out public-key.pem
-   ```
-2. Host `public-key.pem` at
-   `https://<your-registered-domain>/.well-known/appspecific/com.tesla.3p.public-key.pem`
-   (must be the domain you verified in the Developer Portal).
-3. Build/run Tesla's proxy (see
-   https://github.com/teslamotors/vehicle-command for source and prebuilt
-   releases):
-   ```bash
-   tesla-http-proxy -tls-key server-cert.key -cert server-cert.crt \
-     -key-file private-key.pem -port 4443
-   ```
-4. Pair the key with each vehicle from a phone that has the Tesla app and is
-   near/paired with the car, by visiting (on that phone):
-   ```
-   https://tesla.com/_ak/<your-domain>
-   ```
-   Approve the "add key" prompt in the Tesla app.
-5. Leave `TESLA_PROXY_BASE=https://localhost:4443` in `.env` (default). The
-   proxy expects the same bearer access token you already have cached — this
-   program passes it through automatically.
+Everything works per-vehicle, so an account with multiple Teslas is fully
+supported — you can list every vehicle on the account and direct any check
+or command at a specific one.
 
-Until this is set up, `data`, `vehicles`, `wake`, and `region` all work; any
-`command`/shortcut call will fail against the proxy port with a connection
-error.
+## What it's built with
 
-## Usage
+It's written in Python, using Tesla's own official API and Tesla's own
+official command-signing helper program — no unofficial or reverse-engineered
+endpoints. There's no database, no server, and no visual interface; it runs
+locally as a lightweight command-line tool, and everything it knows about
+your car comes fresh from Tesla each time rather than being stored.
 
-```bash
-# Read-only
-python tesla_cli.py vehicles
-python tesla_cli.py data <vehicle_tag>
-python tesla_cli.py data <vehicle_tag> --endpoints charge_state,climate_state
-python tesla_cli.py wake <vehicle_tag>
+## Things worth knowing
 
-# List every known command + its params
-python tesla_cli.py commands
+- A car that's asleep takes a moment to respond to the first command after
+  a while of inactivity — same as it would in the app.
+- Login credentials and access keys are kept only on your own machine, never
+  sent anywhere except to Tesla itself.
+- Tesla occasionally adjusts details of its API, so this is treated as a
+  living project that may need small updates over time to stay in sync.
 
-# Generic command dispatch (works for any command in the catalog)
-python tesla_cli.py command <vehicle_tag> set_charge_limit --data '{"percent": 80}'
+---
 
-# Convenience shortcuts
-python tesla_cli.py lock <vehicle_tag>
-python tesla_cli.py unlock <vehicle_tag>
-python tesla_cli.py honk <vehicle_tag>
-python tesla_cli.py flash <vehicle_tag>
-python tesla_cli.py climate-on <vehicle_tag>
-python tesla_cli.py climate-off <vehicle_tag>
-python tesla_cli.py set-temp <vehicle_tag> --driver 21 --passenger 21
-python tesla_cli.py charge-start <vehicle_tag>
-python tesla_cli.py charge-stop <vehicle_tag>
-python tesla_cli.py set-charge-limit <vehicle_tag> --percent 80
-python tesla_cli.py set-charging-amps <vehicle_tag> --amps 24
-python tesla_cli.py trunk <vehicle_tag> --which rear
-python tesla_cli.py windows <vehicle_tag> --state vent --lat 37.7 --lon -122.4
-python tesla_cli.py sentry <vehicle_tag> --state on
-python tesla_cli.py sunroof <vehicle_tag> --state vent
-python tesla_cli.py seat-heater <vehicle_tag> --seat 0 --level 2
-```
-
-`<vehicle_tag>` is the VIN or numeric vehicle id from `python tesla_cli.py
-vehicles`.
-
-## Notes / gotchas
-
-- A car must not be asleep for commands to land quickly — call `wake` first
-  if a command times out.
-- `set_sentry_mode`, `set_valet_mode`, `set_pin_to_drive`, etc. take an
-  explicit `on`/`password` param; the dedicated `sentry` subcommand handles
-  this correctly, but don't send those through a param-less shortcut.
-- Command names/params can drift as Tesla updates the Fleet API — treat
-  `tesla_fleet/commands.py` as a best-effort catalog and check
-  https://developer.tesla.com/docs/fleet-api if something 404s or 400s.
-- `.tesla_tokens.json` and `.env` contain secrets — keep them out of version
-  control.
+*For the technical setup steps (installing dependencies, configuring API
+credentials, running the command-signing helper), see the code comments and
+`.env.example` in this repository.*
